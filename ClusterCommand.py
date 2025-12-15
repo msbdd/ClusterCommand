@@ -14,7 +14,8 @@ def load_config(path):
 
 
 def ssh_connect(
-    ip, username, key_filename=None, password=None, policy="reject"
+    ip, username, key_filename=None, password=None, policy="reject",
+    timeout="10"
 ):
     client = paramiko.SSHClient()
 
@@ -36,7 +37,7 @@ def ssh_connect(
             username=username,
             key_filename=key_filename,
             password=password,
-            timeout=10,
+            timeout=timeout,
         )
         return client
     except paramiko.BadHostKeyException as e:
@@ -82,6 +83,11 @@ def upload_file(client, local, remote):
         sftp.put(local, remote)
 
 
+def download_file(client, remote, local):
+    with contextlib.closing(client.open_sftp()) as sftp:
+        sftp.get(remote, local)
+
+
 def execute_plan(ip, config, defaults):
     final_config = defaults.copy()
     final_config.update(config)
@@ -91,7 +97,7 @@ def execute_plan(ip, config, defaults):
     password = final_config.get("password")
 
     host_key_policy = final_config.get("host_key_policy", "reject")
-
+    connection_timeout = final_config.get("connection_timeout", "10")
     commands = final_config.get("commands", [])
 
     log = [
@@ -107,6 +113,14 @@ def execute_plan(ip, config, defaults):
         return "\n".join(log), fetch_data
 
     try:
+        timeout = float(connection_timeout)
+    except Exception:
+        log.append(
+            "Incorrect timeout time, using defaults"
+        )
+        timeout = 10
+
+    try:
 
         client = ssh_connect(
             ip,
@@ -114,6 +128,7 @@ def execute_plan(ip, config, defaults):
             key_filename=key_filename,
             password=password,
             policy=host_key_policy,
+            timeout=timeout
         )
     except ConnectionError as e:
         log.append(f"[ERROR] SSH connection failed: {e}")
@@ -122,10 +137,12 @@ def execute_plan(ip, config, defaults):
         log.append(f"[ERROR] Unexpected connection error: {e}")
         return "\n".join(log), fetch_data
 
-    with client:
+    try:
         for step in commands:
-            step_type = step["type"]
-
+            step_type = step.get("type")
+            if step_type not in {"upload", "run", "fetch", "download"}:
+                log.append(f"[ERROR] Invalid step type: {step_type}")
+                return "\n".join(log), fetch_data
             if step_type == "upload":
                 local = step["local"]
                 remote = step["remote"]
@@ -134,6 +151,25 @@ def execute_plan(ip, config, defaults):
                     log.append(f"[UPLOAD OK] {local} → {remote}")
                 except Exception as e:
                     log.append(f"[UPLOAD ERROR] Failed to upload {local}: {e}")
+                    return "\n".join(log), fetch_data
+            elif step_type == "download":
+                remote = step["remote"]
+                download_dir = final_config.get(
+                    "download_folder",
+                    os.path.join(final_config.get("output_folder", "."),
+                                 "downloads")
+                )
+                os.makedirs(download_dir, exist_ok=True)
+                base = os.path.basename(remote)
+                local = f"{ip}_{base}"
+                local_path = os.path.join(download_dir, local)
+
+                try:
+                    download_file(client, remote, local_path)
+                    log.append(f"[DOWNLOAD OK] {remote} → {local_path}")
+                except Exception as e:
+                    log.append(f"[DOWNLOAD ERROR] Failed to "
+                               f"download {remote}: {e}")
                     return "\n".join(log), fetch_data
 
             elif step_type == "run" or step_type == "fetch":
@@ -165,6 +201,9 @@ def execute_plan(ip, config, defaults):
                     for line in lines:
                         if line.strip():
                             fetch_data.append((ip, line.strip()))
+
+    finally:
+        client.close()
 
     log.append(
         f"=== {ip} - SUCCESS: "
@@ -214,7 +253,8 @@ def main():
                              f"ClusterCommand_fetch_{timestamp}.csv")
 
     all_fetch_results = []
-    num_workers = max(os.cpu_count()-1, 1) or 1
+    cpu_count = os.cpu_count() or 1
+    num_workers = max(cpu_count - 1, 1)
     print(f"Starting run on {len(servers)} servers...")
 
     with ThreadPoolExecutor(max_workers=num_workers) as pool:
