@@ -1,0 +1,26 @@
+defaults:
+  username: admin
+  password: admin
+  host_key_policy: auto
+  connection_timeout: 10
+  output_folder: "result"
+  commands:
+    - type: fetch
+      cmd: "uname -a"
+      expect_exit: 0
+
+    - type: download
+      remote: "link"
+      expect_exit: 0
+
+    - type: upload
+      local: "file.txt"
+      remote: "/home/admin/file.txt"
+
+    - type: run
+      cmd: "md5sum /home/admin/file.txt"
+      expect: "MD5SUM /home/admin/file.txt"
+
+servers:
+  - ip: 192.168.1.10
+  - ip: 192.168.1.11
