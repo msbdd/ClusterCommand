@@ -6,6 +6,7 @@ import datetime
 import csv
 import contextlib
 import os
+import re
 
 
 def load_config(path):
@@ -88,6 +89,141 @@ def download_file(client, remote, local):
         sftp.get(remote, local)
 
 
+def evaluate_condition(condition, context):
+    pattern = r'(\w+)\s+(contains|equals|not_contains|not_equals|regex)\s+(.+)'
+    match = re.match(pattern, condition.strip())
+
+    if not match:
+        raise ValueError(f"Invalid condition format: {condition}")
+
+    var_name, operator, value = match.groups()
+    value = value.strip()
+
+    if var_name not in context:
+        return False
+
+    var_value = str(context[var_name])
+
+    if operator == "contains":
+        return value in var_value
+    elif operator == "not_contains":
+        return value not in var_value
+    elif operator == "equals":
+        return var_value == value
+    elif operator == "not_equals":
+        return var_value != value
+    elif operator == "regex":
+        return re.search(value, var_value) is not None
+
+    return False
+
+
+def execute_commands(commands, client, log, fetch_data, context, final_config):
+    for step in commands:
+        step_type = step.get("type")
+
+        if step_type == "conditional":
+            condition = step.get("if")
+            if not condition:
+                log.append("[ERROR] Conditional step missing 'if' clause")
+                return False
+
+            try:
+                result = evaluate_condition(condition, context)
+                log.append(f"[CONDITION] '{condition}' -> {result}")
+
+                if result:
+                    branch = step.get("then", [])
+                    if branch:
+                        log.append("[BRANCH] Executing 'then' branch")
+                        if not execute_commands(branch, client, log,
+                                                fetch_data, context,
+                                                final_config):
+                            return False
+                else:
+                    branch = step.get("else", [])
+                    if branch:
+                        log.append("[BRANCH] Executing 'else' branch")
+                        if not execute_commands(branch, client, log,
+                                                fetch_data, context,
+                                                final_config):
+                            return False
+            except Exception as e:
+                log.append(f"[ERROR] Condition evaluation failed: {e}")
+                return False
+
+        elif step_type == "upload":
+            local = step["local"]
+            remote = step["remote"]
+            try:
+                upload_file(client, local, remote)
+                log.append(f"[UPLOAD OK] {local} → {remote}")
+            except Exception as e:
+                log.append(f"[UPLOAD ERROR] Failed to upload {local}: {e}")
+                return False
+
+        elif step_type == "download":
+            remote = step["remote"]
+            download_dir = final_config.get(
+                "download_folder",
+                os.path.join(final_config.get("output_folder", "."),
+                             "downloads")
+            )
+            os.makedirs(download_dir, exist_ok=True)
+            base = os.path.basename(remote)
+            local = f"{context.get('_ip', 'unknown')}_{base}"
+            local_path = os.path.join(download_dir, local)
+
+            try:
+                download_file(client, remote, local_path)
+                log.append(f"[DOWNLOAD OK] {remote} → {local_path}")
+            except Exception as e:
+                log.append(f"[DOWNLOAD ERROR] Failed to "
+                           f"download {remote}: {e}")
+                return False
+
+        elif step_type == "run" or step_type == "fetch":
+            cmd = step["cmd"]
+            log.append(f"\n> {cmd}")
+
+            out, err, code = run_ssh_command(client, cmd)
+            log.append(out.strip())
+            if err:
+                log.append("ERR: " + err.strip())
+
+            if "store_as" in step:
+                var_name = step["store_as"]
+                context[var_name] = out.strip()
+                log.append(f"[STORED] Output saved to variable '{var_name}'")
+
+            if "expect_exit" in step and code != step["expect_exit"]:
+                log.append(
+                    f"[ERROR] Unexpected exit code {code}. "
+                    f"Expected {step['expect_exit']}"
+                )
+                return False
+
+            if "expect" in step:
+                expected = step.get("expect", "")
+                if expected not in out:
+                    log.append("[ERROR] Expected output missing.")
+                    log.append(f"Missing: {expected}")
+                    return False
+
+            if step_type == "fetch":
+                lines = out.strip().splitlines()
+                for line in lines:
+                    if line.strip():
+                        fetch_data.append((context.get('_ip', 'unknown'),
+                                           line.strip()))
+
+        else:
+            log.append(f"[ERROR] Invalid step type: {step_type}")
+            return False
+
+    return True
+
+
 def execute_plan(ip, config, defaults):
     final_config = defaults.copy()
     final_config.update(config)
@@ -104,7 +240,7 @@ def execute_plan(ip, config, defaults):
         f"=== {ip} - START: {datetime.datetime.now().strftime('%H:%M:%S')} ==="
     ]
     fetch_data = []
-
+    context = {"_ip": ip}
     if not key_filename and not password:
         log.append(
             f"[ERROR] No 'key_filename' or 'password'"
@@ -138,70 +274,10 @@ def execute_plan(ip, config, defaults):
         return "\n".join(log), fetch_data
 
     try:
-        for step in commands:
-            step_type = step.get("type")
-            if step_type not in {"upload", "run", "fetch", "download"}:
-                log.append(f"[ERROR] Invalid step type: {step_type}")
-                return "\n".join(log), fetch_data
-            if step_type == "upload":
-                local = step["local"]
-                remote = step["remote"]
-                try:
-                    upload_file(client, local, remote)
-                    log.append(f"[UPLOAD OK] {local} → {remote}")
-                except Exception as e:
-                    log.append(f"[UPLOAD ERROR] Failed to upload {local}: {e}")
-                    return "\n".join(log), fetch_data
-            elif step_type == "download":
-                remote = step["remote"]
-                download_dir = final_config.get(
-                    "download_folder",
-                    os.path.join(final_config.get("output_folder", "."),
-                                 "downloads")
-                )
-                os.makedirs(download_dir, exist_ok=True)
-                base = os.path.basename(remote)
-                local = f"{ip}_{base}"
-                local_path = os.path.join(download_dir, local)
-
-                try:
-                    download_file(client, remote, local_path)
-                    log.append(f"[DOWNLOAD OK] {remote} → {local_path}")
-                except Exception as e:
-                    log.append(f"[DOWNLOAD ERROR] Failed to "
-                               f"download {remote}: {e}")
-                    return "\n".join(log), fetch_data
-
-            elif step_type == "run" or step_type == "fetch":
-                cmd = step["cmd"]
-                log.append(f"\n> {cmd}")
-
-                out, err, code = run_ssh_command(client, cmd)
-                log.append(out.strip())
-                if err:
-                    log.append("ERR: " + err.strip())
-
-                if "expect_exit" in step and code != step["expect_exit"]:
-                    log.append(
-                        f"[ERROR] Unexpected exit code {code}."
-                        f" Expected {step['expect_exit']}"
-                    )
-                    return "\n".join(log), fetch_data
-
-                if "expect" in step:
-                    expected = step.get("expect", "")
-
-                    if expected not in out:
-                        log.append("[ERROR] Expected output missing.")
-                        log.append(f"Missing: {expected}")
-                        return "\n".join(log), fetch_data
-
-                if step_type == "fetch":
-                    lines = out.strip().splitlines()
-                    for line in lines:
-                        if line.strip():
-                            fetch_data.append((ip, line.strip()))
-
+        success = execute_commands(commands, client, log, fetch_data,
+                                   context, final_config)
+        if not success:
+            return "\n".join(log), fetch_data
     finally:
         client.close()
 
