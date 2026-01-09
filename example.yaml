@@ -5,21 +5,55 @@ defaults:
   connection_timeout: 10
   output_folder: "result"
   commands:
-    - type: fetch
-      cmd: "uname -a"
-      expect_exit: 0
-
-    - type: download
-      remote: "link"
-      expect_exit: 0
-
-    - type: upload
-      local: "file.txt"
-      remote: "/home/admin/file.txt"
-
+    # Store the OS information for later use
     - type: run
-      cmd: "md5sum /home/admin/file.txt"
-      expect: "MD5SUM /home/admin/file.txt"
+      cmd: "uname -a"
+      store_as: "os_type"
+      expect_exit: 0
+
+    # Conditional branching based on detected OS type
+    - type: conditional
+      if: "os_type contains Ubuntu"
+      then:
+        - type: run
+          cmd: "echo 'Ubuntu system detected'"
+        
+        - type: run
+          cmd: "dpkg --list"
+          expect_exit: 0
+        
+        - type: run
+          cmd: "echo 'Package manager: apt/dpkg'"
+      else:
+        - type: conditional
+          if: "os_type regex fc[0-9]+"
+          then:
+            - type: run
+              cmd: "echo 'Fedora system detected'"
+            
+            - type: run
+              cmd: "rpm -qa"
+              expect_exit: 0
+            
+            - type: run
+              cmd: "echo 'Package manager: dnf/rpm'"
+          else:
+            - type: run
+              cmd: "echo 'Other Linux distribution detected'"
+            
+            - type: run
+              cmd: "echo 'OS info stored in os_type variable'"
+
+    # Example of file operations (commented out to avoid errors on demo)
+    # - type: download
+    #   remote: "/etc/hostname"
+
+    # - type: upload
+    #   local: "file.txt"
+    #   remote: "/tmp/file.txt"
+
+    # - type: run
+    #   cmd: "md5sum /tmp/file.txt"
 
 servers:
   - ip: 192.168.1.10
